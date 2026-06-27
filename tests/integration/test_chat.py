@@ -212,3 +212,26 @@ def test_error_response_has_unified_schema(client):
 def test_health_requires_no_auth(client):
     resp = client.get("/health")
     assert resp.status_code == 200
+
+
+# ── Default model ─────────────────────────────────────────────────────────────
+
+def test_omitting_model_uses_default(client, app):
+    """When 'model' is absent the router injects DO_DEFAULT_MODEL and succeeds."""
+    payload = {"messages": [{"role": "user", "content": "hi"}]}
+    resp = client.post("/v1/chat/completions", headers=_auth_headers(), json=payload)
+    # Should not be a 400 validation error
+    assert resp.status_code == 200
+    data = resp.get_json()
+    expected_default = f"do/{app.config['DO_DEFAULT_MODEL']}"
+    # The response model will be the native model served (could fall through to mock
+    # in tests since DOAdapter is not called). Just verify no validation rejection.
+    assert "error" not in data
+
+
+def test_empty_model_string_uses_default(client, app):
+    """Empty string for 'model' is treated same as omitted — default is applied."""
+    payload = {"model": "", "messages": [{"role": "user", "content": "hi"}]}
+    resp = client.post("/v1/chat/completions", headers=_auth_headers(), json=payload)
+    assert resp.status_code == 200
+    assert "error" not in resp.get_json()

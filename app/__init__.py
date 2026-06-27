@@ -26,7 +26,9 @@ def create_app(config: Config | None = None) -> Flask:
     app.config["SERVICE_VERSION"] = cfg.SERVICE_VERSION
     app.config["ENV"] = cfg.APP_ENV
     app.config["ROUTER_API_KEYS"] = cfg.ROUTER_API_KEYS
+    app.config["ROUTER_KEY_SCOPES"] = cfg.ROUTER_KEY_SCOPES
     app.config["MAX_BODY_BYTES"] = cfg.MAX_BODY_BYTES
+    app.config["DO_DEFAULT_MODEL"] = cfg.DO_DEFAULT_MODEL
 
     # Build adapters
     do_adapter = DOAdapter(cfg.DO_INFERENCE_BASE_URL, cfg.DO_INFERENCE_API_KEY)

@@ -6,6 +6,7 @@ import json
 from flask import Blueprint, request, jsonify, g, current_app, Response, stream_with_context
 
 from ..errors import RouterError, error_response
+from ..middleware import require_scope
 from ..streaming.sse import SSE_DONE, sse_event
 
 chat_bp = Blueprint("chat", __name__)
@@ -55,12 +56,18 @@ def _validate(body: dict) -> str | None:
 
 
 @chat_bp.post("/v1/chat/completions")
+@require_scope("chat")
 def chat_completions():
     request_id: str = g.request_id
 
     body = request.get_json(silent=True)
     if body is None:
         return error_response("invalid_request", "Request body must be valid JSON with Content-Type: application/json", 400)
+
+    # Apply default model if caller omitted it
+    if isinstance(body, dict) and not body.get("model"):
+        default_model = f"do/{current_app.config['DO_DEFAULT_MODEL']}"
+        body = {**body, "model": default_model}
 
     err = _validate(body)
     if err:
