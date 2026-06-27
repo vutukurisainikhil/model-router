@@ -2,9 +2,32 @@
 from __future__ import annotations
 
 import uuid
+from functools import wraps
+from typing import Callable
 from flask import Flask, request, g, current_app
 
 from .errors import error_response
+
+
+def require_scope(scope: str) -> Callable:
+    """Route decorator: rejects 403 if the caller's key lacks the required scope.
+
+    Keys with an empty scope set (no ":" in ROUTER_API_KEYS) are unrestricted
+    and pass every scope check.
+    """
+    def decorator(fn: Callable) -> Callable:
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            key_scopes: frozenset[str] = getattr(g, "auth_scopes", frozenset())
+            if key_scopes and scope not in key_scopes:
+                return error_response(
+                    "forbidden",
+                    f"Your API key does not have the '{scope}' scope",
+                    403,
+                )
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
 
 
 def register_middleware(app: Flask) -> None:
@@ -24,6 +47,10 @@ def register_middleware(app: Flask) -> None:
         token = auth_header[7:].strip()
         if token not in current_app.config["ROUTER_API_KEYS"]:
             return error_response("unauthorized", "Invalid API key", 401)
+        # Attach scopes to request context for downstream scope checks.
+        # Falls back to empty frozenset (unrestricted) for plain-key configs.
+        key_scopes_map = current_app.config.get("ROUTER_KEY_SCOPES", {})
+        g.auth_scopes = key_scopes_map.get(token, frozenset())
         return None
 
     @app.before_request

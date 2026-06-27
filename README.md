@@ -150,15 +150,17 @@ Connection: keep-alive
 LLM providers go down. They get overloaded. They rate-limit you. Without fallback, your entire application breaks whenever the primary provider has an issue. With fallback, the user never notices.
 
 **What we built:**  
-Every model has an ordered **fallback chain**. When the primary provider fails, the router silently tries the next one. The client receives a successful response and never sees the failure.
+Every model has an ordered **4-level fallback chain**, descending from the requested model down through cheaper alternatives to a free in-process mock as the final backstop. The client receives a successful response and never sees the failure.
 
 ```
-Request for "do/llama3.3-70b-instruct"
+Request for "do/openai-gpt-4o-mini"
     │
-    ▼
-Try do/llama3.3-70b-instruct  ──503──►  Try mock/echo  ──success──► Return to client
-                                          (client sees provider: "mock", no error)
+    ▼  (503)
+do/openai-gpt-4o-mini  ──fail──►  do/llama3.3-70b-instruct  ──fail──►  do/llama3.1-8b-instruct  ──fail──►  mock/echo
+   $0.15/1M                           $0.60/1M                              $0.10/1M                         $0.00 free
 ```
+
+With `"metadata": {"prefer_cheapest": true}` the chain is **sorted cheapest-first** before the first attempt — useful when quality is less important than cost.
 
 **Not all failures trigger fallback.** The router classifies errors:
 
@@ -258,16 +260,35 @@ python -m flask --app wsgi:app run --port 8000
 
 ---
 
-## Manual Testing (curl)
+## Interview Demo — Copy-Paste Commands
 
-> The default API key in `.env.example` is `dev-router-key-1`. Replace with whatever you set in `ROUTER_API_KEYS`.
+> Start the server first: `source .venv/bin/activate && python -m flask --app wsgi:app run --port 8000`  
+> Default key: `dev-router-key-1`
 
-**1. Health check**
+---
+
+### 0. Health check
 ```bash
 curl -s http://localhost:8000/health | python3 -m json.tool
 ```
+Expected: `{"status": "ok", "service": "model-router", ...}`
 
-**2. Non-streaming — mock provider (no network, instant)**
+---
+
+### 0b. Default model — omit `model` field entirely
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer dev-router-key-1" \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"explain circuit breaker briefly"}]}' \
+  | python3 -m json.tool
+```
+No `model` field → router injects `DO_DEFAULT_MODEL` (`do/llama3.3-70b-instruct`).  
+Expected: `"model": "do/llama3.3-70b-instruct"`, `"provider": "do"`
+
+---
+
+### 1. Instant response — free mock adapter (no network)
 ```bash
 curl -s http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer dev-router-key-1" \
@@ -275,17 +296,44 @@ curl -s http://localhost:8000/v1/chat/completions \
   -d '{"model":"mock/echo","messages":[{"role":"user","content":"hello"}]}' \
   | python3 -m json.tool
 ```
+Expected: `"provider": "mock"`, `X-Router-Attempts: 1`
 
-**3. Non-streaming — real DigitalOcean provider**
+---
+
+### 2. Economy tier — Llama 3.1 8B (fastest, cheapest DO model, $0.10/1M)
 ```bash
 curl -s http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer dev-router-key-1" \
   -H "Content-Type: application/json" \
-  -d '{"model":"do/llama3.3-70b-instruct","messages":[{"role":"user","content":"say hi"}]}' \
+  -d '{"model":"do/llama3.1-8b-instruct","messages":[{"role":"user","content":"what is 2+2? one word answer"}]}' \
   | python3 -m json.tool
 ```
 
-**4. See all router headers**
+---
+
+### 3. Standard tier — Llama 3.3 70B ($0.60/1M)
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer dev-router-key-1" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"do/llama3.3-70b-instruct","messages":[{"role":"user","content":"explain fallback routing in one sentence"}]}' \
+  | python3 -m json.tool
+```
+
+---
+
+### 4. Premium tier — GPT-4o-mini via DO ($0.15 input / $0.60 output per 1M)
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer dev-router-key-1" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"do/openai-gpt-4o-mini","messages":[{"role":"user","content":"explain circuit breaker pattern briefly"}]}' \
+  | python3 -m json.tool
+```
+
+---
+
+### 5. See router headers — observe provider, model, latency, attempts
 ```bash
 curl -si http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer dev-router-key-1" \
@@ -297,30 +345,74 @@ Expected:
 ```
 X-Router-Provider: do
 X-Router-Model: llama3.3-70b-instruct
-X-Router-Latency-Ms: 2100
+X-Router-Latency-Ms: 812
 X-Router-Attempts: 1
-X-Router-Fallback-Chain: do/llama3.3-70b-instruct,mock/echo
+X-Router-Fallback-Chain: do/llama3.3-70b-instruct,do/mistral-24b-instruct,do/llama3.1-8b-instruct,mock/echo
 ```
 
-**5. Streaming — tokens arrive word by word**
+---
+
+### 6. Live SSE streaming — tokens appear word-by-word
 ```bash
 curl -sN http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer dev-router-key-1" \
   -H "Content-Type: application/json" \
-  -d '{"model":"do/llama3.3-70b-instruct","stream":true,"messages":[{"role":"user","content":"count from 1 to 5"}]}'
+  -d '{"model":"do/llama3.3-70b-instruct","stream":true,"messages":[{"role":"user","content":"count from 1 to 10 slowly, one number per line"}]}'
 ```
 
-**6. Streaming — readable word-by-word output**
+---
+
+### 7. Streaming — extract just the text content as it arrives
 ```bash
 curl -sN http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer dev-router-key-1" \
   -H "Content-Type: application/json" \
-  -d '{"model":"do/llama3.3-70b-instruct","stream":true,"messages":[{"role":"user","content":"count from 1 to 5"}]}' \
-  | grep --line-buffered -o '"content": "[^"]*"' \
-  | tr -d '"content: '
+  -d '{"model":"do/llama3.3-70b-instruct","stream":true,"messages":[{"role":"user","content":"write a haiku about APIs"}]}' \
+  | python3 -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if line.startswith('data:') and '[DONE]' not in line:
+        try:
+            c = json.loads(line[5:])['choices'][0]['delta'].get('content','')
+            print(c, end='', flush=True)
+        except: pass
+print()
+"
 ```
 
-**7. Error cases**
+---
+
+### 8. Cost-aware routing — cheapest model tried first
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer dev-router-key-1" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "do/openai-gpt-4o-mini",
+    "messages": [{"role":"user","content":"say hello"}],
+    "metadata": {"prefer_cheapest": true}
+  }' | python3 -m json.tool
+```
+Expected: served by `mock/echo` (cheapest in chain, $0.00) unless you want a real call.
+
+---
+
+### 9. Scope-restricted key — instant 403 without reaching LLM
+```bash
+# Set in .env: ROUTER_API_KEYS=dev-router-key-1,readonly-key:health
+# Then:
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer readonly-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mock/echo","messages":[{"role":"user","content":"hi"}]}' \
+  | python3 -m json.tool
+```
+Expected: `{"error": {"code": "forbidden", "message": "Your API key does not have the 'chat' scope"}}`
+
+---
+
+### 10. Error cases
 ```bash
 # Wrong API key → 401
 curl -s http://localhost:8000/v1/chat/completions \
@@ -344,6 +436,8 @@ curl -s http://localhost:8000/v1/chat/completions \
   | python3 -m json.tool
 ```
 
+---
+
 **Production (gunicorn):**
 ```bash
 gunicorn -w 4 -b 0.0.0.0:8000 wsgi:app
@@ -365,14 +459,17 @@ gunicorn -w 4 -b 0.0.0.0:8000 wsgi:app
 
 ---
 
-## Supported Models
+## Supported Models & Fallback Chains
 
-| Unified ID | Provider | Native model | Fallback |
+| Unified ID | Tier | Cost (input/1M) | Fallback chain |
 |---|---|---|---|
-| `do/llama3.3-70b-instruct` | DigitalOcean | `llama3.3-70b-instruct` | `mock/echo` |
-| `do/openai-gpt-4o-mini` | DigitalOcean | `openai-gpt-4o-mini` | `mock/echo` |
-| `mock/echo` | In-process | — | — |
+| `do/openai-gpt-4o-mini` | Premium | $0.15 | llama3.3-70b → llama3.1-8b → mock/echo |
+| `do/llama3.3-70b-instruct` | Standard | $0.60 | mistral-24b → llama3.1-8b → mock/echo |
+| `do/mistral-24b-instruct` | Mid | $0.27 | llama3.1-8b → mock/echo |
+| `do/llama3.1-8b-instruct` | Economy | $0.10 | mock/echo |
+| `mock/echo` | Free | $0.00 | — (in-process, no network) |
 
+All `do/*` models route through DigitalOcean Serverless Inference (OpenAI-compatible API).  
 Add a new provider by implementing `BaseAdapter` and registering it in `create_app()`.
 
 ---
@@ -424,12 +521,14 @@ Every successful dispatch emits a JSON log event to stdout:
 }
 ```
 
-Fallback example — when primary fails and backup serves:
+Fallback example — primary + two DO fallbacks fail, mock/echo serves:
 ```json
 {
   "attempts": [
     {"provider": "do", "model": "llama3.3-70b-instruct", "outcome": "error", "error_class": "http_503", "latency_ms": 120},
-    {"provider": "mock", "model": "echo", "outcome": "success", "latency_ms": 2}
+    {"provider": "do", "model": "mistral-24b-instruct",  "outcome": "error", "error_class": "http_503", "latency_ms": 95},
+    {"provider": "do", "model": "llama3.1-8b-instruct",  "outcome": "error", "error_class": "http_503", "latency_ms": 88},
+    {"provider": "mock", "model": "echo",                "outcome": "success", "latency_ms": 2}
   ],
   "served_by": "mock"
 }
@@ -442,7 +541,7 @@ Fallback example — when primary fails and backup serves:
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `401 unauthorized` | Wrong or missing bearer token | Check `ROUTER_API_KEYS` in `.env`; token must match exactly |
-| `400 model_not_found` | Unknown model ID | Use `do/llama3.3-70b-instruct`, `do/openai-gpt-4o-mini`, or `mock/echo` |
+| `400 model_not_found` | Unknown model ID | Use `do/openai-gpt-4o-mini`, `do/llama3.3-70b-instruct`, `do/mistral-24b-instruct`, `do/llama3.1-8b-instruct`, or `mock/echo` |
 | `502 upstream_error` | DO API key invalid or service down | Check `DO_INFERENCE_API_KEY`; verify DO status page |
 | Stream not streaming (buffered behind proxy) | Nginx/proxy buffering | Add `proxy_buffering off` or ensure `X-Accel-Buffering: no` is respected |
 | `413` on large prompts | Body exceeds 256 KB | Increase `MAX_BODY_BYTES` in `.env` |

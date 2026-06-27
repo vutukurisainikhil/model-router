@@ -91,9 +91,13 @@ def test_fallback_on_503_returns_200_from_mock(client, do_adapter):
 
 
 def test_fallback_on_503_attempt_header_is_2(client, do_adapter):
+    # Chain for do/llama3.3-70b-instruct is now 4 levels:
+    # llama3.3-70b → mistral-24b → llama3.1-8b → mock/echo
+    # All three DO models use the same do_adapter, so all three fail with 503.
+    # mock/echo succeeds → total attempts = 4.
     with patch.object(do_adapter, "call", side_effect=_make_http_error(503)):
         resp = client.post("/v1/chat/completions", headers=_auth(), json=_base())
-    assert int(resp.headers["X-Router-Attempts"]) == 2
+    assert int(resp.headers["X-Router-Attempts"]) == 4
 
 
 def test_fallback_on_502_returns_200(client, do_adapter):

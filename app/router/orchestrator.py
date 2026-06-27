@@ -16,6 +16,7 @@ from ..adapters.base import BaseAdapter
 from ..errors import RouterError
 from ..logging_setup import log
 from .circuit_breaker import CircuitBreaker
+from .costs import input_cost
 from .model_registry import ModelRegistry
 
 # ── Error classification ──────────────────────────────────────────────────────
@@ -92,9 +93,12 @@ class Orchestrator:
             f"{t['provider']}/{t['model']}" for t in self._build_chain(entry)
         )
 
-    def _build_chain(self, entry: dict) -> list[dict]:
+    def _build_chain(self, entry: dict, prefer_cheapest: bool = False) -> list[dict]:
         chain = [entry["primary"]] + entry.get("fallbacks", [])
-        return chain[: self._max_fallbacks + 1]
+        chain = chain[: self._max_fallbacks + 1]
+        if prefer_cheapest:
+            chain = sorted(chain, key=lambda t: input_cost(f"{t['provider']}/{t['model']}"))
+        return chain
 
     def _get_adapter(self, provider: str) -> BaseAdapter | None:
         return self._adapters.get(provider)
@@ -116,7 +120,8 @@ class Orchestrator:
         if entry is None:
             raise RouterError("model_not_found", f"Unknown model: '{unified_model}'", 400)
 
-        chain = self._build_chain(entry)
+        prefer_cheapest = bool(unified_payload.get("metadata", {}).get("prefer_cheapest"))
+        chain = self._build_chain(entry, prefer_cheapest=prefer_cheapest)
         deadline = time.monotonic() + self._request_deadline_s
         attempts: list[dict] = []
         last_code = "upstream_error"
@@ -210,7 +215,8 @@ class Orchestrator:
         if entry is None:
             raise RouterError("model_not_found", f"Unknown model: '{unified_model}'", 400)
 
-        chain = self._build_chain(entry)
+        prefer_cheapest = bool(unified_payload.get("metadata", {}).get("prefer_cheapest"))
+        chain = self._build_chain(entry, prefer_cheapest=prefer_cheapest)
         deadline = time.monotonic() + self._request_deadline_s
 
         for target in chain:
