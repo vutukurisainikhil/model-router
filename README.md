@@ -52,22 +52,141 @@ Client
 
 ### Features Shipped
 
-**F1 — Unified API & Schema Translation**
-- `POST /v1/chat/completions` with OpenAI-compatible request/response schema
-- Per-provider payload translation (strips `metadata`, rewrites model IDs)
-- Strict input validation with typed error codes
+---
 
-**F2 — Live SSE Streaming**
-- True pipe: chunks yielded one-at-a-time via `stream_with_context`
-- Zero client-side buffering
-- Dual `httpx.Client` per adapter (separate read timeouts for stream vs non-stream)
+#### F1 — Unified API & Schema Translation
 
-**F3 — Resilient Fallback Routing**
-- Ordered fallback chain per model (`primary → fallback[]`)
-- Retryable vs non-retryable HTTP status classification
-- Pre-first-byte streaming fallback: transparent to client
-- Mid-stream abort rule: no fallback after first chunk; yields `finish_reason: error`
-- Sliding-window circuit breaker per `(provider, model)` with exponential back-off
+**The problem it solves:**  
+Every LLM provider has a different API shape. OpenAI uses `max_tokens`, Anthropic uses `max_tokens` too but requires a `system` field at the top level, Gemini uses `generationConfig.maxOutputTokens`. If your application talks directly to providers, you have to write different code for each one. When you switch providers, you rewrite your app.
+
+**What we built:**  
+A single endpoint `POST /v1/chat/completions` that accepts one standard schema (OpenAI-compatible). The client never changes. Behind the scenes, each provider has an **Adapter** that translates the unified format into whatever that provider actually expects, then translates the response back.
+
+```
+Client sends ONE format  →  Adapter translates  →  Provider gets its native format
+                         ←  Adapter translates  ←  Provider sends native response
+```
+
+**What is validated before any provider is called:**
+- `model` field must exist and be a known model ID
+- `messages` must be a non-empty array with valid roles (`user`, `assistant`, `system`, `tool`)
+- `temperature` must be between 0.0 and 2.0
+- `top_p` must be between 0.0 and 1.0
+- `max_tokens` must be a positive integer
+- Body size must be under 256 KB
+- Bearer token must be in the allowed keys list
+
+**What the response always looks like** (regardless of provider):
+```json
+{
+  "id": "chatcmpl_abc123",
+  "object": "chat.completion",
+  "model": "do/llama3.3-70b-instruct",
+  "provider": "do",
+  "choices": [{"message": {"role": "assistant", "content": "..."}, "finish_reason": "stop"}],
+  "usage": {"prompt_tokens": 10, "completion_tokens": 25, "total_tokens": 35}
+}
+```
+
+**Response headers always set:**
+| Header | Example | Meaning |
+|---|---|---|
+| `X-Request-Id` | `a1b2c3d4` | Unique ID to trace this request in logs |
+| `X-Router-Provider` | `do` | Which provider actually answered |
+| `X-Router-Model` | `llama3.3-70b-instruct` | Native model name used |
+| `X-Router-Latency-Ms` | `812` | How long the upstream call took |
+| `X-Router-Attempts` | `2` | How many providers were tried (1 = no fallback) |
+| `X-Router-Fallback-Chain` | `do/llama3.3,mock/echo` | Full chain configured for this model |
+
+---
+
+#### F2 — Live SSE Streaming (Server-Sent Events)
+
+**The problem it solves:**  
+LLMs generate text token by token. Without streaming, your user stares at a blank screen for 3–10 seconds, then the full response appears at once. With streaming, they see words appearing as they're generated — same experience as ChatGPT.
+
+**What we built:**  
+When the client sends `"stream": true`, instead of waiting for the full response, the router opens a persistent HTTP connection and forwards each token chunk to the client **the instant it arrives from the provider**. No buffering anywhere in the pipeline.
+
+```
+Provider generates "Hi" → router immediately sends  →  client sees "Hi"
+Provider generates "!" → router immediately sends   →  client sees "!"
+Provider generates " How" → router immediately sends → client sees " How"
+...
+Provider sends [DONE]  → router closes stream       →  client knows it's finished
+```
+
+**Wire format** — each line the client receives:
+```
+data: {"choices":[{"delta":{"role":"assistant"}}],"provider":"do"}
+
+data: {"choices":[{"delta":{"content":"Hi"}}],"provider":"do"}
+
+data: {"choices":[{"delta":{"content":"!"}}],"provider":"do"}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}],"provider":"do"}
+
+data: [DONE]
+```
+
+**Response headers set for streaming:**
+```
+Content-Type: text/event-stream; charset=utf-8
+Cache-Control: no-cache, no-transform
+X-Accel-Buffering: no          ← tells nginx/proxies: do NOT buffer this
+Connection: keep-alive
+```
+
+**Key technical decisions:**
+- Two separate `httpx.Client` instances per adapter — one for regular calls (60s read timeout), one for streaming (90s read timeout). Streaming needs more time because the first token can take longer to arrive.
+- Flask's `stream_with_context` generator — bytes flush to the socket as they're yielded, not collected in memory first.
+- If the client disconnects mid-stream (closes the browser tab), `GeneratorExit` is raised and the upstream connection is closed immediately — no wasted tokens or quota.
+
+---
+
+#### F3 — Resilient Fallback Routing
+
+**The problem it solves:**  
+LLM providers go down. They get overloaded. They rate-limit you. Without fallback, your entire application breaks whenever the primary provider has an issue. With fallback, the user never notices.
+
+**What we built:**  
+Every model has an ordered **fallback chain**. When the primary provider fails, the router silently tries the next one. The client receives a successful response and never sees the failure.
+
+```
+Request for "do/llama3.3-70b-instruct"
+    │
+    ▼
+Try do/llama3.3-70b-instruct  ──503──►  Try mock/echo  ──success──► Return to client
+                                          (client sees provider: "mock", no error)
+```
+
+**Not all failures trigger fallback.** The router classifies errors:
+
+| Upstream error | Action | Reason |
+|---|---|---|
+| 503 Service Unavailable | ✅ Fallback | Provider is temporarily overloaded |
+| 429 Rate Limited | ✅ Fallback | Try a different provider that isn't rate-limited |
+| 502 Bad Gateway | ✅ Fallback | Infrastructure issue, try elsewhere |
+| Timeout / Connection refused | ✅ Fallback | Provider unreachable |
+| 401 Unauthorized | ❌ No fallback | Your API key is wrong — fallback won't help |
+| 400 Bad Request | ❌ No fallback | Your payload is invalid — fallback won't help |
+| 403 Forbidden | ❌ No fallback | Auth misconfiguration — fallback won't help |
+
+**Streaming fallback has a hard rule:**  
+- Error happens **before any token sent** → silent fallback to next provider ✅  
+- Error happens **after first token sent** → can't fallback (client already received partial response). Instead, send a final error chunk and close cleanly.
+
+**Circuit Breaker — stops trying broken providers:**  
+If a provider fails 50% of the time over the last 20 calls, the circuit **opens** — the router skips that provider instantly without even trying, saving the timeout cost. After 30 seconds, it lets one probe through. If the probe succeeds, the circuit closes and normal routing resumes.
+
+```
+CLOSED (normal) → 10/20 calls fail → OPEN (skip instantly for 30s)
+                                          ↓
+                                    One probe allowed
+                                          ↓
+                           Probe ✅ → CLOSED again
+                           Probe ❌ → OPEN for 60s (doubles each time, max 5 min)
+```
 
 ---
 
