@@ -129,41 +129,100 @@ Default: window=20, min_samples=10, failure_rate=50%, cooldown=30 s.
 ## Quick Start
 
 ```bash
-git clone <repo>
+git clone https://github.com/vutukurisainikhil/model-router.git
 cd model-router
-python -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # fill in ROUTER_API_KEYS and DO_INFERENCE_API_KEY
-python wsgi.py          # dev server on :8000
+cp .env.example .env        # add your ROUTER_API_KEYS and DO_INFERENCE_API_KEY
+python -m flask --app wsgi:app run --port 8000
 ```
 
-**Non-streaming:**
+---
+
+## Manual Testing (curl)
+
+> The default API key in `.env.example` is `dev-router-key-1`. Replace with whatever you set in `ROUTER_API_KEYS`.
+
+**1. Health check**
+```bash
+curl -s http://localhost:8000/health | python3 -m json.tool
+```
+
+**2. Non-streaming — mock provider (no network, instant)**
 ```bash
 curl -s http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer $ROUTER_API_KEY" \
+  -H "Authorization: Bearer dev-router-key-1" \
   -H "Content-Type: application/json" \
-  -d '{"model":"do/llama3.3-70b-instruct","messages":[{"role":"user","content":"hello"}]}'
+  -d '{"model":"mock/echo","messages":[{"role":"user","content":"hello"}]}' \
+  | python3 -m json.tool
 ```
 
-**Streaming:**
+**3. Non-streaming — real DigitalOcean provider**
 ```bash
-curl -N --no-buffer http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer $ROUTER_API_KEY" \
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer dev-router-key-1" \
   -H "Content-Type: application/json" \
-  -d '{"model":"do/llama3.3-70b-instruct","stream":true,"messages":[{"role":"user","content":"count to 5"}]}'
+  -d '{"model":"do/llama3.3-70b-instruct","messages":[{"role":"user","content":"say hi"}]}' \
+  | python3 -m json.tool
 ```
 
-**Offline / mock provider:**
+**4. See all router headers**
 ```bash
-curl -N --no-buffer http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer $ROUTER_API_KEY" \
+curl -si http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer dev-router-key-1" \
   -H "Content-Type: application/json" \
-  -d '{"model":"mock/echo","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"do/llama3.3-70b-instruct","messages":[{"role":"user","content":"hi"}]}' \
+  | grep "X-Router"
+```
+Expected:
+```
+X-Router-Provider: do
+X-Router-Model: llama3.3-70b-instruct
+X-Router-Latency-Ms: 2100
+X-Router-Attempts: 1
+X-Router-Fallback-Chain: do/llama3.3-70b-instruct,mock/echo
 ```
 
-**Health check:**
+**5. Streaming — tokens arrive word by word**
 ```bash
-curl -s http://localhost:8000/health
+curl -sN http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer dev-router-key-1" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"do/llama3.3-70b-instruct","stream":true,"messages":[{"role":"user","content":"count from 1 to 5"}]}'
+```
+
+**6. Streaming — readable word-by-word output**
+```bash
+curl -sN http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer dev-router-key-1" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"do/llama3.3-70b-instruct","stream":true,"messages":[{"role":"user","content":"count from 1 to 5"}]}' \
+  | grep --line-buffered -o '"content": "[^"]*"' \
+  | tr -d '"content: '
+```
+
+**7. Error cases**
+```bash
+# Wrong API key → 401
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer wrong-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mock/echo","messages":[{"role":"user","content":"hi"}]}' \
+  | python3 -m json.tool
+
+# Unknown model → 400 model_not_found
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer dev-router-key-1" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"openai/gpt-5","messages":[{"role":"user","content":"hi"}]}' \
+  | python3 -m json.tool
+
+# Missing messages → 400 invalid_request
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer dev-router-key-1" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mock/echo"}' \
+  | python3 -m json.tool
 ```
 
 **Production (gunicorn):**
